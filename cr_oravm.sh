@@ -108,14 +108,14 @@ _outputMode="terse"
 _azureOwner="`whoami`"
 _azureProject="oravm"
 _azureRegion="westus"
-_azureSubscription=""
+_azureSubscription="c560a042-4311-40cf-beb5-edc67991179e"
 _workDir="`pwd`"
 _skipSaVnetSubnetNsg="false"
 _vmUrn="Oracle:Oracle-Database-Ee:12.2.0.1:12.2.20180725"
 _vmDomain="internal.cloudapp.net"
 _vmOsDiskSize="32"
 _vmInstanceType="Standard_DS11-1_v2"
-_vmDataDiskNbr=1
+_vmDataDiskNbr=0
 _vmDataDiskSzGB=4095
 _vmDataDiskCaching="ReadOnly"
 _vgName="vg_ora01"
@@ -150,6 +150,10 @@ _nicName="${_azureOwner}-${_azureProject}-nic01"
 _pubIpName="${_azureOwner}-${_azureProject}-public-ip01"
 _vmName="${_azureOwner}-${_azureProject}-vm01"
 _logFile="${_workDir}/${_azureOwner}-${_azureProject}.log"
+_ANFaccountName="${_azureOwner}-${_azureProject}-naa"
+_ANFpoolName="${_azureOwner}-${_azureProject}-pool"
+_ANFvolumeName="${_azureOwner}-${_azureProject}-vol"
+_ANFsubnetName="${_azureOwner}-${_azureProject}-anfnet"
 #
 #--------------------------------------------------------------------------------
 # Accept command-line parameter values to override default values (above)..
@@ -230,6 +234,10 @@ _nicName="${_azureOwner}-${_azureProject}-nic01"
 _pubIpName="${_azureOwner}-${_azureProject}-public-ip01"
 _vmName="${_azureOwner}-${_azureProject}-vm01"
 _logFile="${_workDir}/${_azureOwner}-${_azureProject}.log"
+_ANFaccountName="${_azureOwner}-${_azureProject}-naa"
+_ANFpoolName="${_azureOwner}-${_azureProject}-pool"
+_ANFvolumeName="${_azureOwner}-${_azureProject}-vol"
+_ANFsubnetName="${_azureOwner}-${_azureProject}-anfnet"
 #
 #--------------------------------------------------------------------------------
 # Display variable values when output is set to "verbose"...
@@ -275,6 +283,10 @@ then
 	echo "`date` - DBUG: variable _oraMemPct is \"${_oraMemPct}\""
 	echo "`date` - DBUG: variable _oraMemType is \"${_oraMemType}\""
 	echo "`date` - DBUG: variable _oraFraSzGB is \"${_oraFraSzGB}\""
+	echo "`date` - DBUG: variable _ANFaccountName is \"${_ANFaccountName}\""
+	echo "`date` - DBUG: variable _ANFpoolName is \"${_ANFpoolName}\""
+	echo "`date` - DBUG: variable _ANFvolumeName is \"${_ANFvolumeName}\""
+	echo "`date` - DBUG: variable _ANFsubnetName is \"${_ANFsubnetName}\""
 fi
 #
 #--------------------------------------------------------------------------------
@@ -464,11 +476,166 @@ ssh-keygen -f "${HOME}/.ssh/known_hosts" -R ${_ipAddr} >> ${_logFile} 2>&1
 echo "`date` - INFO: public IP ${_ipAddr} for ${_vmName}..." | tee -a ${_logFile}
 #
 #--------------------------------------------------------------------------------
-# If no data disks are requested on the VM, then skip straight to the successful
-# completion of the script... do not pass "GO", do not collect $200...
+# If no data disks are requested on the VM, then deploy Azure NetApp Files...
 #--------------------------------------------------------------------------------
 if (( ${_vmDataDiskNbr} <= 0 )); then
-	echo "`date` - INFO: no data disks requested, completed successfully!" | tee -a ${_logFile}
+	echo "`date` - INFO: no data disks requested, Azure NetApp Files it is!" | tee -a ${_logFile}
+	#
+	#--------------------------------------------------------------------------------
+	# SSH into the first VM to create a directory mount-point for the soon-to-be-created
+	# Azure NetApp Files NFS volume in which Oracle database files will reside...
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: mkdir ${_oraMntDir} on ${_vmName}..." | tee -a ${_logFile}
+	ssh -o StrictHostKeyChecking=no ${_azureOwner}@${_ipAddr} "sudo mkdir -p ${_oraMntDir}"
+	if (( $? != 0 )); then
+		echo "`date` - FAIL: sudo mkdir -p ${_oraMntDir} on ${_vmName}" | tee -a ${_logFile}
+		exit 1
+	fi
+	#
+	#--------------------------------------------------------------------------------
+	# SSH into the first VM to set the OS account:group ownership of the
+	# directory mount-point...
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: chown ${_oraMntDir} on ${_vmName}..." | tee -a ${_logFile}
+	ssh ${_azureOwner}@${_ipAddr} "sudo chown ${_oraOsAcct}:${_oraOsGroup} ${_oraMntDir}"
+	if (( $? != 0 )); then
+		echo "`date` - FAIL: sudo chown ${_oraMntDir} on ${_vmName}" | tee -a ${_logFile}
+		exit 1
+	fi
+	#
+	#--------------------------------------------------------------------------------
+	# Obtain the private IP address of the VM for future use within the script...
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: az network nic ip-config show ${_nicName}..." | tee -a ${_logFile}
+	_privateipAddr=`az network nic ip-config show --nic-name ${_nicName} --name ipconfig1 | \
+		jq '. | {ipaddr: .privateIpAddress}' | \
+		grep ipaddr | \
+		awk '{print $2}' | \
+		sed 's/"//g'`
+	if (( $? != 0 )); then
+		echo "`date` - FAIL: az network nic ip-config show ${_nicName}" | tee -a ${_logFile}
+		exit 1
+	fi
+	#
+	#--------------------------------------------------------------------------------
+	## Create Azure NetApp Files Delegated Subnet
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: az network vnet subnet create ${_ANFsubnetName}..." | tee -a ${_logFile}
+	az network vnet subnet create \
+	--name ${_ANFsubnetName} \
+	--vnet-name ${_vnetName} \
+	--delegation Microsoft.Netapp/volumes \
+	--address-prefixes 10.0.1.0/24 \
+	--verbose >> ${_logFile} 2>&1
+	if (( $? != 0 )); then
+		echo "`date` - FAIL: az network vnet subnet create ${_ANFsubnetName}" | tee -a ${_logFile}
+		exit 1
+	fi
+	#
+	#--------------------------------------------------------------------------------
+	## Create the Azure NetApp Files (ANF) NetApp Account
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: az netappfiles account create ${_ANFaccountName}..." | tee -a ${_logFile}
+	az netappfiles account create \
+	--account-name ${_ANFaccountName} \
+	--tags owner=${_azureOwner} project=${_azureProject} \
+	--verbose >> ${_logFile} 2>&1
+	if (( $? != 0 )); then
+		echo "`date` - FAIL: az netappfiles account create ${_ANFaccountName}" | tee -a ${_logFile}
+		exit 1
+	fi
+	#
+	#--------------------------------------------------------------------------------
+	## Create the ANF Capacity Pool
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: az netappfiles pool create ${_ANFpoolName}..." | tee -a ${_logFile}
+	az netappfiles pool create \
+	--account-name ${_ANFaccountName} \
+	--pool-name ${_ANFpoolName} \
+	--service-level Premium \
+	--size 4 \
+	--tags owner=${_azureOwner} project=${_azureProject} \
+	--verbose >> ${_logFile} 2>&1
+	if (( $? != 0 )); then
+		echo "`date` - FAIL: az netappfiles pool create ${_ANFpoolName}" | tee -a ${_logFile}
+		exit 1
+	fi
+	#
+	#--------------------------------------------------------------------------------
+	## Create the ANF Volume
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: az netappfiles volume create ${_ANFvolumeName}..." | tee -a ${_logFile}
+	az netappfiles volume create \
+	--account-name ${_ANFaccountName} \
+	--pool-name ${_ANFpoolName} \
+	--volume-name ${_ANFvolumeName} \
+	--file-path ${_ANFvolumeName}\
+	--usage-threshold 500 \
+	--vnet ${_vnetName} \
+	--subnet ${_ANFsubnetName} \
+	--protocol-types NFSv4.1 \
+	--verbose >> ${_logFile} 2>&1
+	if (( $? != 0 )); then
+		echo "`date` - FAIL: az netappfiles volume create ${_ANFvolumeName}" | tee -a ${_logFile}
+		exit 1
+	fi
+	#
+	#--------------------------------------------------------------------------------
+	## Add a rule to the NFS export policy for our VM at index 2
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: az netappfiles volume export-policy create for ${_privateipAddr}..." | tee -a ${_logFile}
+	az netappfiles volume export-policy add \
+	--account-name ${_ANFaccountName} \
+	--pool-name ${_ANFpoolName} \
+	--volume-name ${_ANFvolumeName} \
+	--allowed-clients ${_privateipAddr} \
+	--rule-index 2 \
+	--nfsv41 true \
+	--nfsv3 false \
+	--cifs false \
+	--unix-read-only false \
+	--unix-read-write true \
+	--verbose >> ${_logFile} 2>&1
+	if (( $? != 0 )); then
+		echo "`date` - FAIL: az netappfiles volume export-policy create for ${_privateipAddr}" | tee -a ${_logFile}
+		exit 1
+	fi
+	#
+	#--------------------------------------------------------------------------------
+	## Remove the default rule from the volume export policy at index 1
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: az netappfiles volume export-policy remove for 0.0.0.0/0..." | tee -a ${_logFile}
+	az netappfiles volume export-policy remove \
+	--account-name ${_ANFaccountName} \
+	--pool-name ${_ANFpoolName} \
+	--volume-name ${_ANFvolumeName} \
+	--rule-index 1 \
+	--verbose >> ${_logFile} 2>&1
+	if (( $? != 0 )); then
+		echo "`date` - FAIL: az netappfiles volume export-policy remove for 0.0.0.0/0" | tee -a ${_logFile}
+		exit 1
+	fi
+	#
+	#--------------------------------------------------------------------------------
+	## Get the Azure NetApp Files endpoint IP address
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: az netappfiles volume show ${_ANFvolumeName}..." | tee -a ${_logFile}
+	_ANFipAddr=`az netappfiles volume show --account-name ${_ANFaccountName} --pool-name ${_ANFpoolName} --volume-name ${_ANFvolumeName} | jq '.mountTargets[0].ipAddress' | sed 's/"//g'`
+	if (( $? != 0 )); then
+		echo "`date` - FAIL: az netappfiles volume show ${_ANFvolumeName}" | tee -a ${_logFile}
+		exit 1
+	fi
+	#
+	#--------------------------------------------------------------------------------
+	# SSH into the first VM to mount the newly created Azure NetApp Files
+	# NFS volume in which the Oracle database files will reside...
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: mount ${_ANFvolumeName} on ${_vmName}..." | tee -a ${_logFile}
+	ssh -o StrictHostKeyChecking=no ${_azureOwner}@${_ipAddr} "sudo mount -t nfs -o rw,hard,rsize=65536,wsize=65536,sec=sys,vers=4.1,tcp ${_ANFipAddr}:/${_ANFvolumeName} ${_oraMntDir}"
+	if (( $? != 0 )); then
+		echo "`date` - FAIL: mount ${_ANFvolumeName} on ${_vmName}" | tee -a ${_logFile}
+		exit 1
+	fi
 	exit 0
 fi
 #

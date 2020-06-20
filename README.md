@@ -1,5 +1,5 @@
 # oravm
-Azure CLI (bash) script to fully automate the creation of an Azure VM to run Oracle database
+Azure CLI (bash) script to fully automate the creation of an Azure VM to run Oracle database with Azure NetApp Files
 
 ## Description:
 
@@ -50,7 +50,9 @@ Azure CLI (bash) script to fully automate the creation of an Azure VM to run Ora
 
         4) For users who are expected to use prebuilt storage accounts
            and networking (i.e. vnet, subnet, network security groups, etc),
-           consider using the "-N" switch to accept these as prerequisites 
+           consider using the "-N" switch to accept these as prerequisites
+        
+        5) To use Azure NetApp Files, specify 0 for the number of data disks (-n 0)   
 
 # Usage examples
 
