@@ -98,17 +98,18 @@
 #	TGorman	23apr20	written v0.1
 #	TGorman	15jun20 various bug fixes for v0.2
 #	TGorman	16jun20 move TEMP to temporary disk for v0.3
+#	SLuce and TGorman 22jun20 add Azure NetApp Files (ANF) storage for v0.4
 #================================================================================
 #
 #--------------------------------------------------------------------------------
 # Set global environment variables with default values...
 #--------------------------------------------------------------------------------
-_progVersion="0.3"
+_progVersion="0.4"
 _outputMode="terse"
 _azureOwner="`whoami`"
 _azureProject="oravm"
 _azureRegion="westus"
-_azureSubscription="c560a042-4311-40cf-beb5-edc67991179e"
+_azureSubscription=""
 _workDir="`pwd`"
 _skipSaVnetSubnetNsg="false"
 _vmUrn="Oracle:Oracle-Database-Ee:12.2.0.1:12.2.20180725"
@@ -476,170 +477,6 @@ ssh-keygen -f "${HOME}/.ssh/known_hosts" -R ${_ipAddr} >> ${_logFile} 2>&1
 echo "`date` - INFO: public IP ${_ipAddr} for ${_vmName}..." | tee -a ${_logFile}
 #
 #--------------------------------------------------------------------------------
-# If no data disks are requested on the VM, then deploy Azure NetApp Files...
-#--------------------------------------------------------------------------------
-if (( ${_vmDataDiskNbr} <= 0 )); then
-	echo "`date` - INFO: no data disks requested, Azure NetApp Files it is!" | tee -a ${_logFile}
-	#
-	#--------------------------------------------------------------------------------
-	# SSH into the first VM to create a directory mount-point for the soon-to-be-created
-	# Azure NetApp Files NFS volume in which Oracle database files will reside...
-	#--------------------------------------------------------------------------------
-	echo "`date` - INFO: mkdir ${_oraMntDir} on ${_vmName}..." | tee -a ${_logFile}
-	ssh -o StrictHostKeyChecking=no ${_azureOwner}@${_ipAddr} "sudo mkdir -p ${_oraMntDir}"
-	if (( $? != 0 )); then
-		echo "`date` - FAIL: sudo mkdir -p ${_oraMntDir} on ${_vmName}" | tee -a ${_logFile}
-		exit 1
-	fi
-	#
-	#--------------------------------------------------------------------------------
-	# SSH into the first VM to set the OS account:group ownership of the
-	# directory mount-point...
-	#--------------------------------------------------------------------------------
-	echo "`date` - INFO: chown ${_oraMntDir} on ${_vmName}..." | tee -a ${_logFile}
-	ssh ${_azureOwner}@${_ipAddr} "sudo chown ${_oraOsAcct}:${_oraOsGroup} ${_oraMntDir}"
-	if (( $? != 0 )); then
-		echo "`date` - FAIL: sudo chown ${_oraMntDir} on ${_vmName}" | tee -a ${_logFile}
-		exit 1
-	fi
-	#
-	#--------------------------------------------------------------------------------
-	# Obtain the private IP address of the VM for future use within the script...
-	#--------------------------------------------------------------------------------
-	echo "`date` - INFO: az network nic ip-config show ${_nicName}..." | tee -a ${_logFile}
-	_privateipAddr=`az network nic ip-config show --nic-name ${_nicName} --name ipconfig1 | \
-		jq '. | {ipaddr: .privateIpAddress}' | \
-		grep ipaddr | \
-		awk '{print $2}' | \
-		sed 's/"//g'`
-	if (( $? != 0 )); then
-		echo "`date` - FAIL: az network nic ip-config show ${_nicName}" | tee -a ${_logFile}
-		exit 1
-	fi
-	#
-	#--------------------------------------------------------------------------------
-	## Create Azure NetApp Files Delegated Subnet
-	#--------------------------------------------------------------------------------
-	echo "`date` - INFO: az network vnet subnet create ${_ANFsubnetName}..." | tee -a ${_logFile}
-	az network vnet subnet create \
-	--name ${_ANFsubnetName} \
-	--vnet-name ${_vnetName} \
-	--delegation Microsoft.Netapp/volumes \
-	--address-prefixes 10.0.1.0/24 \
-	--verbose >> ${_logFile} 2>&1
-	if (( $? != 0 )); then
-		echo "`date` - FAIL: az network vnet subnet create ${_ANFsubnetName}" | tee -a ${_logFile}
-		exit 1
-	fi
-	#
-	#--------------------------------------------------------------------------------
-	## Create the Azure NetApp Files (ANF) NetApp Account
-	#--------------------------------------------------------------------------------
-	echo "`date` - INFO: az netappfiles account create ${_ANFaccountName}..." | tee -a ${_logFile}
-	az netappfiles account create \
-	--account-name ${_ANFaccountName} \
-	--tags owner=${_azureOwner} project=${_azureProject} \
-	--verbose >> ${_logFile} 2>&1
-	if (( $? != 0 )); then
-		echo "`date` - FAIL: az netappfiles account create ${_ANFaccountName}" | tee -a ${_logFile}
-		exit 1
-	fi
-	#
-	#--------------------------------------------------------------------------------
-	## Create the ANF Capacity Pool
-	#--------------------------------------------------------------------------------
-	echo "`date` - INFO: az netappfiles pool create ${_ANFpoolName}..." | tee -a ${_logFile}
-	az netappfiles pool create \
-	--account-name ${_ANFaccountName} \
-	--pool-name ${_ANFpoolName} \
-	--service-level Premium \
-	--size 4 \
-	--tags owner=${_azureOwner} project=${_azureProject} \
-	--verbose >> ${_logFile} 2>&1
-	if (( $? != 0 )); then
-		echo "`date` - FAIL: az netappfiles pool create ${_ANFpoolName}" | tee -a ${_logFile}
-		exit 1
-	fi
-	#
-	#--------------------------------------------------------------------------------
-	## Create the ANF Volume
-	#--------------------------------------------------------------------------------
-	echo "`date` - INFO: az netappfiles volume create ${_ANFvolumeName}..." | tee -a ${_logFile}
-	az netappfiles volume create \
-	--account-name ${_ANFaccountName} \
-	--pool-name ${_ANFpoolName} \
-	--volume-name ${_ANFvolumeName} \
-	--file-path ${_ANFvolumeName}\
-	--usage-threshold 500 \
-	--vnet ${_vnetName} \
-	--subnet ${_ANFsubnetName} \
-	--protocol-types NFSv4.1 \
-	--verbose >> ${_logFile} 2>&1
-	if (( $? != 0 )); then
-		echo "`date` - FAIL: az netappfiles volume create ${_ANFvolumeName}" | tee -a ${_logFile}
-		exit 1
-	fi
-	#
-	#--------------------------------------------------------------------------------
-	## Add a rule to the NFS export policy for our VM at index 2
-	#--------------------------------------------------------------------------------
-	echo "`date` - INFO: az netappfiles volume export-policy create for ${_privateipAddr}..." | tee -a ${_logFile}
-	az netappfiles volume export-policy add \
-	--account-name ${_ANFaccountName} \
-	--pool-name ${_ANFpoolName} \
-	--volume-name ${_ANFvolumeName} \
-	--allowed-clients ${_privateipAddr} \
-	--rule-index 2 \
-	--nfsv41 true \
-	--nfsv3 false \
-	--cifs false \
-	--unix-read-only false \
-	--unix-read-write true \
-	--verbose >> ${_logFile} 2>&1
-	if (( $? != 0 )); then
-		echo "`date` - FAIL: az netappfiles volume export-policy create for ${_privateipAddr}" | tee -a ${_logFile}
-		exit 1
-	fi
-	#
-	#--------------------------------------------------------------------------------
-	## Remove the default rule from the volume export policy at index 1
-	#--------------------------------------------------------------------------------
-	echo "`date` - INFO: az netappfiles volume export-policy remove for 0.0.0.0/0..." | tee -a ${_logFile}
-	az netappfiles volume export-policy remove \
-	--account-name ${_ANFaccountName} \
-	--pool-name ${_ANFpoolName} \
-	--volume-name ${_ANFvolumeName} \
-	--rule-index 1 \
-	--verbose >> ${_logFile} 2>&1
-	if (( $? != 0 )); then
-		echo "`date` - FAIL: az netappfiles volume export-policy remove for 0.0.0.0/0" | tee -a ${_logFile}
-		exit 1
-	fi
-	#
-	#--------------------------------------------------------------------------------
-	## Get the Azure NetApp Files endpoint IP address
-	#--------------------------------------------------------------------------------
-	echo "`date` - INFO: az netappfiles volume show ${_ANFvolumeName}..." | tee -a ${_logFile}
-	_ANFipAddr=`az netappfiles volume show --account-name ${_ANFaccountName} --pool-name ${_ANFpoolName} --volume-name ${_ANFvolumeName} | jq '.mountTargets[0].ipAddress' | sed 's/"//g'`
-	if (( $? != 0 )); then
-		echo "`date` - FAIL: az netappfiles volume show ${_ANFvolumeName}" | tee -a ${_logFile}
-		exit 1
-	fi
-	#
-	#--------------------------------------------------------------------------------
-	# SSH into the first VM to mount the newly created Azure NetApp Files
-	# NFS volume in which the Oracle database files will reside...
-	#--------------------------------------------------------------------------------
-	echo "`date` - INFO: mount ${_ANFvolumeName} on ${_vmName}..." | tee -a ${_logFile}
-	ssh -o StrictHostKeyChecking=no ${_azureOwner}@${_ipAddr} "sudo mount -t nfs -o rw,hard,rsize=65536,wsize=65536,sec=sys,vers=4.1,tcp ${_ANFipAddr}:/${_ANFvolumeName} ${_oraMntDir}"
-	if (( $? != 0 )); then
-		echo "`date` - FAIL: mount ${_ANFvolumeName} on ${_vmName}" | tee -a ${_logFile}
-		exit 1
-	fi
-	exit 0
-fi
-#
-#--------------------------------------------------------------------------------
 # SSH into the first VM to create a directory mount-point for the soon-to-be-created
 # filesystem in which Oracle database files will reside...
 #--------------------------------------------------------------------------------
@@ -662,148 +499,310 @@ if (( $? != 0 )); then
 fi
 #
 #--------------------------------------------------------------------------------
-# SSH into the first VM to install the "LVM2" package using the Linux "yum"
-# utility...
+# If no data disks are requested on the VM, then deploy Azure NetApp Files...
 #--------------------------------------------------------------------------------
-echo "`date` - INFO: yum install lvm2 on ${_vmName}..." | tee -a ${_logFile}
-ssh ${_azureOwner}@${_ipAddr} "sudo yum install -y lvm2" >> ${_logFile} 2>&1
-if (( $? != 0 )); then
-	echo "`date` - FAIL: yum install lvm2 on ${_vmName}" | tee -a ${_logFile}
-	exit 1
-fi
-#
-#--------------------------------------------------------------------------------
-# Loop to attach the specified number of data disks...
-#--------------------------------------------------------------------------------
-typeset -i _diskAttached=0
-_pvList=""
-while (( ${_diskAttached} < ${_vmDataDiskNbr} )); do
+if (( ${_vmDataDiskNbr} <= 0 )); then
+	echo "`date` - INFO: no data disks requested, Azure NetApp Files it is!" | tee -a ${_logFile}
 	#
-	#------------------------------------------------------------------------
-	# Increment the counter of attached data disks...
-	#------------------------------------------------------------------------
-	typeset -i _diskAttached=${_diskAttached}+1
-	_diskNbr="`echo ${_diskAttached} | awk '{printf("%02d\n",$1)}'`"
+	#--------------------------------------------------------------------------------
+	# Obtain the private IP address of the VM for future use within the script...
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: az network nic ip-config show ${_nicName}..." | tee -a ${_logFile}
+	_privateipAddr=`az network nic ip-config show --nic-name ${_nicName} --name ipconfig1 | \
+		jq '. | {ipaddr: .privateIpAddress}' | \
+		grep ipaddr | \
+		awk '{print $2}' | \
+		sed 's/"//g'`
+	if (( $? != 0 )); then
+		echo "`date` - FAIL: az network nic ip-config show ${_nicName}" | tee -a ${_logFile}
+		exit 1
+	fi
 	#
-	#------------------------------------------------------------------------
-	# Create and attach a data disk to the VM...
-	#------------------------------------------------------------------------
-	echo "`date` - INFO: az vm disk attach (${_vmName}-datadisk${_diskNbr})..." | tee -a ${_logFile}
-	az vm disk attach \
-		--new \
-		--name ${_vmName}-datadisk${_diskNbr} \
-		--vm-name ${_vmName} \
-		--caching ReadOnly \
-		--size-gb ${_vmDataDiskSzGB} \
-		--sku Premium_LRS \
+	#--------------------------------------------------------------------------------
+	## Create Azure NetApp Files Delegated Subnet
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: az network vnet subnet create ${_ANFsubnetName}..." | tee -a ${_logFile}
+	az network vnet subnet create \
+		--name ${_ANFsubnetName} \
+		--vnet-name ${_vnetName} \
+		--delegation Microsoft.Netapp/volumes \
+		--address-prefixes 10.0.1.0/24 \
 		--verbose >> ${_logFile} 2>&1
 	if (( $? != 0 )); then
-		echo "`date` - FAIL: az vm disk create ${_vmName} (${_diskAttached})" | tee -a ${_logFile}
+		echo "`date` - FAIL: az network vnet subnet create ${_ANFsubnetName}" | tee -a ${_logFile}
 		exit 1
 	fi
 	#
-	#------------------------------------------------------------------------
-	# Identify the name of the SCSI device from the array initialized at the
-	# beginning of the script, and derive the name of the single partition on
-	# the SCSI device, then add to the list of SCSI partitions for later use...
-	#------------------------------------------------------------------------
-	_scsiDev="/dev/${_scsiDevList[${_diskAttached}]}"
-	_pvName="${_scsiDev}1"
-	_pvList="${_pvList}${_pvName} "
-	#
-	#------------------------------------------------------------------------
-	# SSH into the VM to create a GPT label on the SCSI device...
-	#------------------------------------------------------------------------
-	echo "`date` - INFO: parted ${_scsiDev} mklabel on ${_vmName}..." | tee -a ${_logFile}
-	ssh ${_azureOwner}@${_ipAddr} "sudo parted ${_scsiDev} mklabel gpt" >> ${_logFile} 2>&1
+	#--------------------------------------------------------------------------------
+	## Create the Azure NetApp Files (ANF) NetApp Account
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: az netappfiles account create ${_ANFaccountName}..." | tee -a ${_logFile}
+	az netappfiles account create \
+		--account-name ${_ANFaccountName} \
+		--tags owner=${_azureOwner} project=${_azureProject} \
+		--verbose >> ${_logFile} 2>&1
 	if (( $? != 0 )); then
-		echo "`date` - FAIL: parted ${_scsiDev} mklabel gpt on ${_vmName}" | tee -a ${_logFile}
+		echo "`date` - FAIL: az netappfiles account create ${_ANFaccountName}" | tee -a ${_logFile}
 		exit 1
 	fi
 	#
-	#------------------------------------------------------------------------
-	# SSH into the VM to create a single primary partitition consuming the
-	# entire SCSI device...
-	#------------------------------------------------------------------------
-	echo "`date` - INFO: parted ${_scsiDev} mkpart primary on ${_vmName}..." | tee -a ${_logFile}
-	ssh ${_azureOwner}@${_ipAddr} "sudo parted -a opt ${_scsiDev} mkpart primary ext4 0% 100%" >> ${_logFile} 2>&1
+	#--------------------------------------------------------------------------------
+	## Create the ANF Capacity Pool
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: az netappfiles pool create ${_ANFpoolName}..." | tee -a ${_logFile}
+	az netappfiles pool create \
+		--account-name ${_ANFaccountName} \
+		--pool-name ${_ANFpoolName} \
+		--service-level Premium \
+		--size 4 \
+		--tags owner=${_azureOwner} project=${_azureProject} \
+		--verbose >> ${_logFile} 2>&1
 	if (( $? != 0 )); then
-		echo "`date` - FAIL: yum parted mkpart -a opt ${_scsiDev} primary ext4 0% 100% on ${_vmName}" | tee -a ${_logFile}
+		echo "`date` - FAIL: az netappfiles pool create ${_ANFpoolName}" | tee -a ${_logFile}
 		exit 1
 	fi
 	#
-	#------------------------------------------------------------------------
-	# SSH into the VM to create a physical partition from the SCSI partition...
-	#------------------------------------------------------------------------
-	echo "`date` - INFO: pvcreate ${_pvName} on ${_vmName}..." | tee -a ${_logFile}
-	ssh ${_azureOwner}@${_ipAddr} "sudo pvcreate ${_pvName}" >> ${_logFile} 2>&1
+	#--------------------------------------------------------------------------------
+	## Create the ANF Volume
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: az netappfiles volume create ${_ANFvolumeName}..." | tee -a ${_logFile}
+	az netappfiles volume create \
+		--account-name ${_ANFaccountName} \
+		--pool-name ${_ANFpoolName} \
+		--volume-name ${_ANFvolumeName} \
+		--file-path ${_ANFvolumeName}\
+		--usage-threshold 500 \
+		--vnet ${_vnetName} \
+		--subnet ${_ANFsubnetName} \
+		--protocol-types NFSv3 \
+		--verbose >> ${_logFile} 2>&1
 	if (( $? != 0 )); then
-		echo "`date` - FAIL: pvcreate ${_pvName} on ${_vmName}" | tee -a ${_logFile}
+		echo "`date` - FAIL: az netappfiles volume create ${_ANFvolumeName}" | tee -a ${_logFile}
 		exit 1
 	fi
 	#
-done
-#
-#--------------------------------------------------------------------------------
-# Create a volume group from the list of physcial volumes...
-#--------------------------------------------------------------------------------
-echo "`date` - INFO: vgcreate ${_vgName} ${_pvList} on ${_vmName}..." | tee -a ${_logFile}
-ssh ${_azureOwner}@${_ipAddr} "sudo vgcreate ${_vgName} ${_pvList}" >> ${_logFile} 2>&1
-if (( $? != 0 )); then
-	echo "`date` - FAIL: vgcreate ${_vgName} ${_pvList} on ${_vmName}" | tee -a ${_logFile}
-	exit 1
-fi
-#
-#--------------------------------------------------------------------------------
-# Obtain the PE Size and Total # of PEs in the volume group, to obtain the size
-# (in MiB) of all the physical volumes in the volume group, which will be the
-# size of the soon-to-be-created logical volume...
-#--------------------------------------------------------------------------------
-echo "`date` - INFO: vgdisplay ${_vgName} on ${_vmName}..." | tee -a ${_logFile}
-_peTotal=`ssh ${_azureOwner}@${_ipAddr} "sudo vgdisplay ${_vgName} | grep 'Total PE' | awk '{print \\\$3}'"`
-if (( $? != 0 )); then
-	echo "`date` - FAIL: vgdisplay ${_vgName} | grep 'Total PE' on ${_vmName}" | tee -a ${_logFile}
-	exit 1
-fi
-_peSize=`ssh ${_azureOwner}@${_ipAddr} "sudo vgdisplay ${_vgName} | grep 'PE Size' | awk '{print \\\$3}'"`
-if (( $? != 0 )); then
-	echo "`date` - FAIL: vgdisplay ${_vgName} | grep 'PE Size' on ${_vmName}" | tee -a ${_logFile}
-	exit 1
-fi
-typeset -i _lvSize=`echo ${_peTotal} ${_peSize} | awk '{printf("%d\n",$1*$2)}'`
-if (( $? != 0 )); then
-	echo "`date` - FAIL: awk '{printf(${_peTotal} * ${_peSize})" | tee -a ${_logFile}
-	exit 1
-fi
-#
-#--------------------------------------------------------------------------------
-# SSH into the VM to create a logical volume from the allocated data disks...
-#--------------------------------------------------------------------------------
-echo "`date` - INFO: lvcreate ${_vgName} on ${_vmName}..." | tee -a ${_logFile}
-ssh ${_azureOwner}@${_ipAddr} "sudo lvcreate -n ${_lvName} -i ${_vmDataDiskNbr} -I 1024k -L ${_lvSize}m ${_vgName} ${_pvList}" >> ${_logFile} 2>&1
-if (( $? != 0 )); then
-	echo "`date` - FAIL: lvcreate -n ${_lvName} -i ${_vmDataDiskNbr} -I 1024k -L ${_lvSize}m ${_vgName} ${_pvList} on ${_vmName}" | tee -a ${_logFile}
-	exit 1
-fi
-#
-#--------------------------------------------------------------------------------
-# SSH into the VM to create an EXT4 filesystem on the logical volume...
-#--------------------------------------------------------------------------------
-echo "`date` - INFO: mkfs.ext4 /dev/${_vgName}/${_lvName} on ${_vmName}..." | tee -a ${_logFile}
-ssh ${_azureOwner}@${_ipAddr} "sudo mkfs.ext4 /dev/${_vgName}/${_lvName}" >> ${_logFile} 2>&1
-if (( $? != 0 )); then
-	echo "`date` - FAIL: mkfs.ext4 /dev/${_vgName}/${_lvName} on ${_vmName}" | tee -a ${_logFile}
-	exit 1
-fi
-#
-#--------------------------------------------------------------------------------
-# SSH into the VM to mount the filesystem on "/u02"...
-#--------------------------------------------------------------------------------
-echo "`date` - INFO: mount /dev/${_vgName}/${_lvName} ${_oraMntDir} on ${_vmName}..." | tee -a ${_logFile}
-ssh ${_azureOwner}@${_ipAddr} "sudo mount /dev/${_vgName}/${_lvName} ${_oraMntDir}" >> ${_logFile} 2>&1
-if (( $? != 0 )); then
-	echo "`date` - FAIL: mount /dev/${_vgName}/${_lvName} ${_oraMntDir} on ${_vmName}" | tee -a ${_logFile}
-	exit 1
+	#--------------------------------------------------------------------------------
+	## Add a rule to the NFS export policy for our VM at index 2
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: az netappfiles volume export-policy create for ${_privateipAddr}..." | tee -a ${_logFile}
+	az netappfiles volume export-policy add \
+		--account-name ${_ANFaccountName} \
+		--pool-name ${_ANFpoolName} \
+		--volume-name ${_ANFvolumeName} \
+		--allowed-clients ${_privateipAddr} \
+		--rule-index 2 \
+		--nfsv41 false \
+		--nfsv3 true \
+		--cifs false \
+		--unix-read-only false \
+		--unix-read-write true \
+		--verbose >> ${_logFile} 2>&1
+	if (( $? != 0 )); then
+		echo "`date` - FAIL: az netappfiles volume export-policy create for ${_privateipAddr}" | tee -a ${_logFile}
+		exit 1
+	fi
+	#
+	#--------------------------------------------------------------------------------
+	## Remove the default rule from the volume export policy at index 1
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: az netappfiles volume export-policy remove for 0.0.0.0/0..." | tee -a ${_logFile}
+	az netappfiles volume export-policy remove \
+		--account-name ${_ANFaccountName} \
+		--pool-name ${_ANFpoolName} \
+		--volume-name ${_ANFvolumeName} \
+		--rule-index 1 \
+		--verbose >> ${_logFile} 2>&1
+	if (( $? != 0 )); then
+		echo "`date` - FAIL: az netappfiles volume export-policy remove for 0.0.0.0/0" | tee -a ${_logFile}
+		exit 1
+	fi
+	#
+	#--------------------------------------------------------------------------------
+	## Get the Azure NetApp Files endpoint IP address
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: az netappfiles volume show ${_ANFvolumeName}..." | tee -a ${_logFile}
+	_ANFipAddr=`az netappfiles volume show \
+			--account-name ${_ANFaccountName} \
+			--pool-name ${_ANFpoolName} \
+			--volume-name ${_ANFvolumeName} | \
+			jq '.mountTargets[0].ipAddress' | \
+			sed 's/"//g'`
+	if (( $? != 0 )); then
+		echo "`date` - FAIL: az netappfiles volume show ${_ANFvolumeName}" | tee -a ${_logFile}
+		exit 1
+	fi
+	#
+	#--------------------------------------------------------------------------------
+	# SSH into the first VM to mount the newly created Azure NetApp Files
+	# NFS volume in which the Oracle database files will reside...
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: mount ${_ANFvolumeName} on ${_vmName}..." | tee -a ${_logFile}
+	ssh -o StrictHostKeyChecking=no ${_azureOwner}@${_ipAddr} "\
+		sudo mount -t nfs \
+			-o rw,bg,hard,vers=3,proto=tcp,timeo=600,rsize=65536,wsize=65536 \
+			${_ANFipAddr}:/${_ANFvolumeName} ${_oraMntDir}"
+	if (( $? != 0 )); then
+		echo "`date` - FAIL: mount ${_ANFvolumeName} on ${_vmName}" | tee -a ${_logFile}
+		exit 1
+	fi
+	#--------------------------------------------------------------------------------
+	# SSH into the first VM to set the OS account:group ownership of the
+	# directory mount-point...
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: chown ${_oraMntDir} on ${_vmName}..." | tee -a ${_logFile}
+	ssh ${_azureOwner}@${_ipAddr} "sudo chown ${_oraOsAcct}:${_oraOsGroup} ${_oraMntDir}"
+	if (( $? != 0 )); then
+		echo "`date` - FAIL: sudo chown ${_oraMntDir} on ${_vmName}" | tee -a ${_logFile}
+		exit 1
+	fi
+	#
+else # ...else if _nbrDataDisks > 0, then use managed disks for database storage...
+	#
+	#--------------------------------------------------------------------------------
+	# SSH into the first VM to install the "LVM2" package using the Linux "yum"
+	# utility...
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: yum install lvm2 on ${_vmName}..." | tee -a ${_logFile}
+	ssh ${_azureOwner}@${_ipAddr} "sudo yum install -y lvm2" >> ${_logFile} 2>&1
+	if (( $? != 0 )); then
+		echo "`date` - FAIL: yum install lvm2 on ${_vmName}" | tee -a ${_logFile}
+		exit 1
+	fi
+	#
+	#--------------------------------------------------------------------------------
+	# Loop to attach the specified number of data disks...
+	#--------------------------------------------------------------------------------
+	typeset -i _diskAttached=0
+	_pvList=""
+	while (( ${_diskAttached} < ${_vmDataDiskNbr} )); do
+		#
+		#------------------------------------------------------------------------
+		# Increment the counter of attached data disks...
+		#------------------------------------------------------------------------
+		typeset -i _diskAttached=${_diskAttached}+1
+		_diskNbr="`echo ${_diskAttached} | awk '{printf("%02d\n",$1)}'`"
+		#
+		#------------------------------------------------------------------------
+		# Create and attach a data disk to the VM...
+		#------------------------------------------------------------------------
+		echo "`date` - INFO: az vm disk attach (${_vmName}-datadisk${_diskNbr})..." | tee -a ${_logFile}
+		az vm disk attach \
+			--new \
+			--name ${_vmName}-datadisk${_diskNbr} \
+			--vm-name ${_vmName} \
+			--caching ReadOnly \
+			--size-gb ${_vmDataDiskSzGB} \
+			--sku Premium_LRS \
+			--verbose >> ${_logFile} 2>&1
+		if (( $? != 0 )); then
+			echo "`date` - FAIL: az vm disk create ${_vmName} (${_diskAttached})" | tee -a ${_logFile}
+			exit 1
+		fi
+		#
+		#------------------------------------------------------------------------
+		# Identify the name of the SCSI device from the array initialized at the
+		# beginning of the script, and derive the name of the single partition on
+		# the SCSI device, then add to the list of SCSI partitions for later use...
+		#------------------------------------------------------------------------
+		_scsiDev="/dev/${_scsiDevList[${_diskAttached}]}"
+		_pvName="${_scsiDev}1"
+		_pvList="${_pvList}${_pvName} "
+		#
+		#------------------------------------------------------------------------
+		# SSH into the VM to create a GPT label on the SCSI device...
+		#------------------------------------------------------------------------
+		echo "`date` - INFO: parted ${_scsiDev} mklabel on ${_vmName}..." | tee -a ${_logFile}
+		ssh ${_azureOwner}@${_ipAddr} "sudo parted ${_scsiDev} mklabel gpt" >> ${_logFile} 2>&1
+		if (( $? != 0 )); then
+			echo "`date` - FAIL: parted ${_scsiDev} mklabel gpt on ${_vmName}" | tee -a ${_logFile}
+			exit 1
+		fi
+		#
+		#------------------------------------------------------------------------
+		# SSH into the VM to create a single primary partitition consuming the
+		# entire SCSI device...
+		#------------------------------------------------------------------------
+		echo "`date` - INFO: parted ${_scsiDev} mkpart primary on ${_vmName}..." | tee -a ${_logFile}
+		ssh ${_azureOwner}@${_ipAddr} "sudo parted -a opt ${_scsiDev} mkpart primary ext4 0% 100%" >> ${_logFile} 2>&1
+		if (( $? != 0 )); then
+			echo "`date` - FAIL: yum parted mkpart -a opt ${_scsiDev} primary ext4 0% 100% on ${_vmName}" | tee -a ${_logFile}
+			exit 1
+		fi
+		#
+		#------------------------------------------------------------------------
+		# SSH into the VM to create a physical partition from the SCSI partition...
+		#------------------------------------------------------------------------
+		echo "`date` - INFO: pvcreate ${_pvName} on ${_vmName}..." | tee -a ${_logFile}
+		ssh ${_azureOwner}@${_ipAddr} "sudo pvcreate ${_pvName}" >> ${_logFile} 2>&1
+		if (( $? != 0 )); then
+			echo "`date` - FAIL: pvcreate ${_pvName} on ${_vmName}" | tee -a ${_logFile}
+			exit 1
+		fi
+		#
+	done
+	#
+	#--------------------------------------------------------------------------------
+	# Create a volume group from the list of physcial volumes...
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: vgcreate ${_vgName} ${_pvList} on ${_vmName}..." | tee -a ${_logFile}
+	ssh ${_azureOwner}@${_ipAddr} "sudo vgcreate ${_vgName} ${_pvList}" >> ${_logFile} 2>&1
+	if (( $? != 0 )); then
+		echo "`date` - FAIL: vgcreate ${_vgName} ${_pvList} on ${_vmName}" | tee -a ${_logFile}
+		exit 1
+	fi
+	#
+	#--------------------------------------------------------------------------------
+	# Obtain the PE Size and Total # of PEs in the volume group, to obtain the size
+	# (in MiB) of all the physical volumes in the volume group, which will be the
+	# size of the soon-to-be-created logical volume...
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: vgdisplay ${_vgName} on ${_vmName}..." | tee -a ${_logFile}
+	_peTotal=`ssh ${_azureOwner}@${_ipAddr} "sudo vgdisplay ${_vgName} | grep 'Total PE' | awk '{print \\\$3}'"`
+	if (( $? != 0 )); then
+		echo "`date` - FAIL: vgdisplay ${_vgName} | grep 'Total PE' on ${_vmName}" | tee -a ${_logFile}
+		exit 1
+	fi
+	_peSize=`ssh ${_azureOwner}@${_ipAddr} "sudo vgdisplay ${_vgName} | grep 'PE Size' | awk '{print \\\$3}'"`
+	if (( $? != 0 )); then
+		echo "`date` - FAIL: vgdisplay ${_vgName} | grep 'PE Size' on ${_vmName}" | tee -a ${_logFile}
+		exit 1
+	fi
+	typeset -i _lvSize=`echo ${_peTotal} ${_peSize} | awk '{printf("%d\n",$1*$2)}'`
+	if (( $? != 0 )); then
+		echo "`date` - FAIL: awk '{printf(${_peTotal} * ${_peSize})" | tee -a ${_logFile}
+		exit 1
+	fi
+	#
+	#--------------------------------------------------------------------------------
+	# SSH into the VM to create a logical volume from the allocated data disks...
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: lvcreate ${_vgName} on ${_vmName}..." | tee -a ${_logFile}
+	ssh ${_azureOwner}@${_ipAddr} "sudo lvcreate -n ${_lvName} -i ${_vmDataDiskNbr} -I 1024k -L ${_lvSize}m ${_vgName} ${_pvList}" >> ${_logFile} 2>&1
+	if (( $? != 0 )); then
+		echo "`date` - FAIL: lvcreate -n ${_lvName} -i ${_vmDataDiskNbr} -I 1024k -L ${_lvSize}m ${_vgName} ${_pvList} on ${_vmName}" | tee -a ${_logFile}
+		exit 1
+	fi
+	#
+	#--------------------------------------------------------------------------------
+	# SSH into the VM to create an EXT4 filesystem on the logical volume...
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: mkfs.ext4 /dev/${_vgName}/${_lvName} on ${_vmName}..." | tee -a ${_logFile}
+	ssh ${_azureOwner}@${_ipAddr} "sudo mkfs.ext4 /dev/${_vgName}/${_lvName}" >> ${_logFile} 2>&1
+	if (( $? != 0 )); then
+		echo "`date` - FAIL: mkfs.ext4 /dev/${_vgName}/${_lvName} on ${_vmName}" | tee -a ${_logFile}
+		exit 1
+	fi
+	#
+	#--------------------------------------------------------------------------------
+	# SSH into the VM to mount the filesystem on "/u02"...
+	#--------------------------------------------------------------------------------
+	echo "`date` - INFO: mount /dev/${_vgName}/${_lvName} ${_oraMntDir} on ${_vmName}..." | tee -a ${_logFile}
+	ssh ${_azureOwner}@${_ipAddr} "sudo mount /dev/${_vgName}/${_lvName} ${_oraMntDir}" >> ${_logFile} 2>&1
+	if (( $? != 0 )); then
+		echo "`date` - FAIL: mount /dev/${_vgName}/${_lvName} ${_oraMntDir} on ${_vmName}" | tee -a ${_logFile}
+		exit 1
+	fi
+	#
 fi
 #
 #------------------------------------------------------------------------
